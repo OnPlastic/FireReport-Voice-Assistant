@@ -1,0 +1,14 @@
+# Runtime dependencies for FRVA
+# Python >= 3.11 required
+
+openai-whisper
+sounddevice
+numpy
+piper-tts
+nicegui
+python-dotenv
+pytest
+ruff
+pdoc
+mkdocs
+mkdocs-material

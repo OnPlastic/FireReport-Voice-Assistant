@@ -1,0 +1,15 @@
+.venv/
+__pychache__/
+*.pyc
+.env
+logs/*
+data/output/*
+*.wav
+*.mp3
+.pytest_cache/
+dist/
+build/
+*.egg.info
+site/
+data/models/piper/*
+*.onnx
