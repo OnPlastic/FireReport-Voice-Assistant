@@ -1,5 +1,5 @@
 .venv/
-__pychache__/
+__pycache__/
 *.pyc
 .env
 logs/*
@@ -9,7 +9,9 @@ data/output/*
 .pytest_cache/
 dist/
 build/
-*.egg.info
+*.egg-info
 site/
-data/models/piper/*
+
+data/models/piper/
 *.onnx
+*.onnx.json
