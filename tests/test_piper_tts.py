@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-import wave
 from dataclasses import dataclass
 from pathlib import Path
 
 
 DEFAULT_PIPER_BINARY = "piper"
-DEFAULT_PIPER_MODEL_PATH = Path("data/models/piper/de_DE-thorsten-high.onnx")
-DEFAULT_PIPER_CONFIG_PATH = Path("data/models/piper/de_DE-thorsten-high.onnx.json")
+DEFAULT_PIPER_MODEL_PATH = Path("models/piper/de_DE-thorsten-high.onnx")
+DEFAULT_PIPER_CONFIG_PATH = Path("models/piper/de_DE-thorsten-high.onnx.json")
 
 
 @dataclass(frozen=True)
@@ -21,8 +20,6 @@ class PiperConfig:
     binary: str = DEFAULT_PIPER_BINARY
     model_path: Path = DEFAULT_PIPER_MODEL_PATH
     config_path: Path | None = DEFAULT_PIPER_CONFIG_PATH
-    length_scale: float = 1.3
-    leading_silence_ms: int = 200
 
 
 def is_piper_available(binary: str = DEFAULT_PIPER_BINARY) -> bool:
@@ -30,35 +27,32 @@ def is_piper_available(binary: str = DEFAULT_PIPER_BINARY) -> bool:
     return shutil.which(binary) is not None
 
 
-def add_leading_silence_to_wav(wav_path: str | Path, silence_ms: int) -> None:
-    """Fügt einer WAV-Datei am Anfang etwas Stille hinzu."""
-    if silence_ms <= 0:
-        return
-
-    path = Path(wav_path)
-
-    with wave.open(str(path), "rb") as reader:
-        params = reader.getparams()
-        frames = reader.readframes(reader.getnframes())
-
-    frame_rate = params.framerate
-    sample_width = params.sampwidth
-    channels = params.nchannels
-
-    silence_frames = int(frame_rate * (silence_ms / 1000.0))
-    silence_bytes = b"\x00" * silence_frames * sample_width * channels
-
-    with wave.open(str(path), "wb") as writer:
-        writer.setparams(params)
-        writer.writeframes(silence_bytes + frames)
-
-
 def synthesize_speech_to_file(
     text: str,
     output_path: str | Path,
     config: PiperConfig | None = None,
 ) -> Path:
-    """Erzeugt aus Text eine WAV-Datei mit Piper."""
+    """Erzeugt aus Text eine WAV-Datei mit Piper.
+
+    Args:
+        text:
+            Zu sprechender Text.
+        output_path:
+            Zielpfad der erzeugten WAV-Datei.
+        config:
+            Optionale Piper-Konfiguration.
+
+    Returns:
+        Der Zielpfad als Path.
+
+    Raises:
+        ValueError:
+            Wenn kein sinnvoller Text übergeben wurde.
+        FileNotFoundError:
+            Wenn Binary oder Modell fehlen oder keine Datei erzeugt wurde.
+        subprocess.CalledProcessError:
+            Wenn Piper mit Fehler endet.
+    """
     cleaned_text = text.strip()
     if not cleaned_text:
         raise ValueError("Es wurde kein Text zur Sprachausgabe übergeben.")
@@ -79,8 +73,6 @@ def synthesize_speech_to_file(
         str(cfg.model_path),
         "--output_file",
         str(output),
-        "--length_scale",
-        str(cfg.length_scale),
     ]
 
     if cfg.config_path is not None and cfg.config_path.exists():
@@ -98,7 +90,5 @@ def synthesize_speech_to_file(
         raise FileNotFoundError(
             f"Piper hat keine Ausgabedatei erzeugt: {output}"
         )
-
-    add_leading_silence_to_wav(output, cfg.leading_silence_ms)
 
     return output
