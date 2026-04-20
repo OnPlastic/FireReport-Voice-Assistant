@@ -7,13 +7,14 @@ from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
-from nicegui import app, events, ui
+from nicegui import app, ui
 
-from frva.audio.recorder import create_uploaded_audio_path
+from frva.audio.recorder import create_recorded_audio_path, save_data_url_audio
 from frva.asr.whisper_asr import transcribe_audio_file
 from frva.dialog.manager import process_turn, start_dialog
 from frva.dialog.state import DialogSession
 from frva.extraction.basic_extractor import extract_updates
+from frva.nlp.gemini_extractor import extract_updates_with_gemini
 from frva.report.formatter import format_report_summary
 from frva.report.generator import generate_report_text
 from frva.tts.piper_tts import synthesize_speech_to_file
@@ -28,22 +29,18 @@ TTS_ROUTE = "/tts_audio"
 
 @dataclass
 class ChatMessage:
-    """Ein sichtbarer Eintrag im Gesprächsverlauf."""
     role: Role
     text: str
 
 
 @dataclass
 class AppState:
-    """UI-Zustand für die MVP-Oberfläche."""
     session: DialogSession | None = None
     status: str = "Bereit"
     messages: list[ChatMessage] = field(default_factory=list)
+    tts_audio_url: str = ""
     summary: str = ""
     report: str = ""
-    current_question: str = "-"
-    recognized_answer: str = "-"
-    tts_audio_url: str = ""
 
 
 def append_message(state: AppState, role: Role, text: str) -> None:
@@ -51,84 +48,278 @@ def append_message(state: AppState, role: Role, text: str) -> None:
 
 
 def speak_text_to_url(text: str) -> str:
-    """Erzeugt eine TTS-Datei und liefert die statische URL zurück."""
     output_path = TTS_OUTPUT_DIR / f"tts_{uuid4().hex}.wav"
     synthesize_speech_to_file(text, output_path)
     return f"{TTS_ROUTE}/{output_path.name}"
 
 
-def set_assistant_question(
-    state: AppState,
-    question: str | None,
-    *,
-    speaker=speak_text_to_url,
-) -> None:
+def set_assistant_question(state: AppState, question: str | None) -> None:
+    print("=== SET_ASSISTANT_QUESTION ===")
+    print(question)
+    print("==============================")
+
     if question is None:
-        state.current_question = "-"
-        state.tts_audio_url = ""
         return
 
-    state.current_question = question
     append_message(state, "assistant", question)
-
-    audio_url = speaker(question)
+    state.status = "Florian spricht ..."
+    audio_url = speak_text_to_url(question)
     state.tts_audio_url = audio_url or ""
 
 
-def start_ui_session(state: AppState) -> str | None:
+def start_ui_session(state: AppState) -> None:
     state.session = DialogSession()
     state.messages.clear()
+    state.tts_audio_url = ""
     state.summary = ""
     state.report = ""
-    state.recognized_answer = "-"
-    state.tts_audio_url = ""
     state.status = "Dialog gestartet"
 
     first_question = start_dialog(state.session)
 
-    if first_question is not None:
+    print("=== FIRST QUESTION ===")
+    print(first_question)
+    print("======================")
+
+    if first_question:
         set_assistant_question(state, first_question)
         state.status = "Warte auf Antwort"
     else:
-        state.current_question = "-"
         state.status = "Bericht vollständig"
 
-    return first_question
+
+def extract_updates_for_text(text: str) -> dict:
+    try:
+        updates = extract_updates_with_gemini(text)
+        if updates:
+            return updates
+    except Exception as exc:
+        print(f"Gemini Fehler: {exc}")
+
+    return extract_updates(text)
 
 
-def handle_text_input(state: AppState, text: str) -> str | None:
+def handle_text_input(state: AppState, text: str) -> None:
     cleaned_text = text.strip()
     if not cleaned_text:
-        return None
+        return
 
     if state.session is None:
         start_ui_session(state)
 
-    assert state.session is not None
-
-    state.recognized_answer = cleaned_text
     append_message(state, "user", cleaned_text)
-    state.status = "Verarbeite Antwort"
+    state.status = "Analysiere Antwort ..."
 
-    updates = extract_updates(cleaned_text)
+    updates = extract_updates_for_text(cleaned_text)
+    print("=== APP UPDATES ===")
+    print(updates)
+    print("===================")
+
     next_question = process_turn(
         session=state.session,
         user_transcript=cleaned_text,
         updates=updates,
     )
 
-    if next_question is not None:
-        set_assistant_question(state, next_question)
-        state.status = "Habe erkannt"
-        return next_question
+    print("=== NEXT QUESTION ===")
+    print(next_question)
+    print("=====================")
 
-    state.current_question = "-"
-    state.tts_audio_url = ""
-    state.summary = format_report_summary(state.session.report_state)
-    state.report = generate_report_text(state.session.report_state)
-    append_message(state, "system", "Danke, der Bericht ist vollständig.")
-    state.status = "Bericht vollständig"
-    return None
+    if next_question:
+        set_assistant_question(state, next_question)
+        state.status = "Warte auf Antwort"
+    else:
+        append_message(state, "system", "Danke, der Bericht ist vollständig.")
+        state.status = "Fertig"
+        if state.session is not None:
+            state.summary = format_report_summary(state.session.report_state)
+            state.report = generate_report_text(state.session.report_state)
+
+    print("=== HANDLE_TEXT_INPUT DONE ===")
+
+
+def build_browser_recorder_js() -> str:
+    return r"""
+        (async () => {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+            return await new Promise(async (resolve, reject) => {
+                let mimeType = '';
+                if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+                    mimeType = 'audio/webm;codecs=opus';
+                } else if (MediaRecorder.isTypeSupported('audio/webm')) {
+                    mimeType = 'audio/webm';
+                } else if (MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')) {
+                    mimeType = 'audio/ogg;codecs=opus';
+                }
+
+                const options = mimeType
+                    ? { mimeType, audioBitsPerSecond: 16000 }
+                    : { audioBitsPerSecond: 16000 };
+
+                const recorder = new MediaRecorder(stream, options);
+                const chunks = [];
+
+                const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+                const audioContext = new AudioContextClass();
+                const source = audioContext.createMediaStreamSource(stream);
+                const analyser = audioContext.createAnalyser();
+
+                analyser.fftSize = 1024;
+                source.connect(analyser);
+
+                const data = new Uint8Array(analyser.fftSize);
+
+                const silenceThreshold = 6;
+                const silenceDurationMs = 2200;
+                const startupGraceMs = 1500;
+                const maxRecordingMs = 6000;
+
+                let silenceStart = null;
+                let stopped = false;
+                let monitoringStarted = false;
+                let maxTimeoutId = null;
+
+                const cleanup = async () => {
+                    try {
+                        stream.getTracks().forEach(track => track.stop());
+                    } catch (e) {
+                    }
+
+                    try {
+                        source.disconnect();
+                    } catch (e) {
+                    }
+
+                    try {
+                        analyser.disconnect();
+                    } catch (e) {
+                    }
+
+                    try {
+                        await audioContext.close();
+                    } catch (e) {
+                    }
+
+                    if (maxTimeoutId !== null) {
+                        clearTimeout(maxTimeoutId);
+                    }
+                };
+
+                const stopRecorder = () => {
+                    if (stopped) {
+                        return;
+                    }
+                    stopped = true;
+                    try {
+                        recorder.stop();
+                    } catch (e) {
+                    }
+                };
+
+                recorder.ondataavailable = (event) => {
+                    if (event.data && event.data.size > 0) {
+                        chunks.push(event.data);
+                    }
+                };
+
+                recorder.onerror = async (event) => {
+                    await cleanup();
+                    reject(event.error || new Error('Recorder-Fehler'));
+                };
+
+                recorder.onstop = async () => {
+                    try {
+                        const blob = new Blob(
+                            chunks,
+                            { type: recorder.mimeType || mimeType || 'audio/webm' }
+                        );
+
+                        if (blob.size === 0) {
+                            await cleanup();
+                            reject(new Error('Leere Audioaufnahme.'));
+                            return;
+                        }
+
+                        const reader = new FileReader();
+                        reader.onloadend = async () => {
+                            await cleanup();
+                            resolve({
+                                mimeType: blob.type || recorder.mimeType || mimeType || 'audio/webm',
+                                dataUrl: reader.result,
+                                size: blob.size,
+                            });
+                        };
+                        reader.onerror = async () => {
+                            await cleanup();
+                            reject(new Error('Audio konnte nicht gelesen werden.'));
+                        };
+                        reader.readAsDataURL(blob);
+                    } catch (error) {
+                        await cleanup();
+                        reject(error);
+                    }
+                };
+
+                const checkSilence = () => {
+                    if (stopped) {
+                        return;
+                    }
+
+                    analyser.getByteTimeDomainData(data);
+
+                    let sumSquares = 0;
+                    for (let i = 0; i < data.length; i++) {
+                        const normalized = (data[i] - 128) / 128;
+                        sumSquares += normalized * normalized;
+                    }
+
+                    const rms = Math.sqrt(sumSquares / data.length);
+                    const level = rms * 1000;
+
+                    if (!monitoringStarted) {
+                        requestAnimationFrame(checkSilence);
+                        return;
+                    }
+
+                    if (level < silenceThreshold) {
+                        if (silenceStart === null) {
+                            silenceStart = performance.now();
+                        } else if (performance.now() - silenceStart >= silenceDurationMs) {
+                            stopRecorder();
+                            return;
+                        }
+                    } else {
+                        silenceStart = null;
+                    }
+
+                    requestAnimationFrame(checkSilence);
+                };
+
+                recorder.start(250);
+
+                setTimeout(() => {
+                    monitoringStarted = true;
+                }, startupGraceMs);
+
+                maxTimeoutId = setTimeout(() => {
+                    stopRecorder();
+                }, maxRecordingMs);
+
+                requestAnimationFrame(checkSilence);
+            });
+        })()
+    """
+
+
+def suffix_from_mime_type(mime_type: str) -> str:
+    lowered = mime_type.lower()
+
+    if "ogg" in lowered:
+        return ".ogg"
+    if "mp4" in lowered or "mpeg" in lowered or "m4a" in lowered:
+        return ".m4a"
+    return ".webm"
 
 
 def build_ui() -> None:
@@ -136,34 +327,20 @@ def build_ui() -> None:
 
     state = AppState()
 
-    with ui.column().classes("w-full max-w-5xl mx-auto p-4 gap-4 pb-24"):
+    with ui.column().classes("w-full max-w-3xl mx-auto p-4 gap-4 pb-24"):
         ui.label("FireReport Voice Assistant").classes("text-3xl font-bold")
 
-        with ui.row().classes("w-full items-center gap-3"):
+        with ui.row().classes("gap-3"):
             start_button = ui.button("Dialog starten").classes("px-6 py-2")
-            text_input = ui.input(
-                label="Antwort eingeben",
-                placeholder="Antwort hier eingeben und mit Enter senden ...",
-            ).classes("w-full")
+            record_button = ui.button("Antwort aufnehmen").classes("px-6 py-2")
+            text_toggle_button = ui.button("Textantwort").classes("px-6 py-2")
 
-        with ui.row().classes("w-full items-center gap-3"):
-            ui.label("Audio-Datei für Whisper hochladen").classes("text-sm text-gray-600")
-            audio_upload = ui.upload(
-                label="Audio hochladen",
-                auto_upload=True,
-            ).props('accept=".wav,.mp3,.m4a,.ogg,.webm,.mp4,.mpeg,.mpga"').classes("w-full")
+        manual_text_input = ui.input(
+            placeholder="Fallback: Antwort hier eintippen und Enter drücken ...",
+        ).classes("w-full")
+        manual_text_input.set_visibility(False)
 
-        with ui.card().classes("w-full"):
-            ui.label("Aktuelle Frage von Florian").classes("text-sm text-gray-600")
-            current_question_label = ui.label(state.current_question).classes(
-                "text-xl font-medium whitespace-pre-wrap"
-            )
-
-        with ui.card().classes("w-full"):
-            ui.label("Zuletzt erkannte Antwort").classes("text-sm text-gray-600")
-            recognized_answer_label = ui.label(state.recognized_answer).classes(
-                "text-lg whitespace-pre-wrap"
-            )
+        chat_container = ui.column().classes("w-full gap-3")
 
         audio_player = ui.audio(
             state.tts_audio_url,
@@ -171,93 +348,106 @@ def build_ui() -> None:
             autoplay=True,
         ).style("display: none;")
 
-        ui.separator()
-
-        ui.label("Verlauf").classes("text-lg font-semibold")
-        chat_container = ui.column().classes("w-full gap-2")
-
-        ui.separator()
-
-        ui.label("Zusammenfassung").classes("text-lg font-semibold")
-        summary_label = ui.label("").classes("whitespace-pre-wrap w-full")
-
-        ui.label("Bericht").classes("text-lg font-semibold")
-        report_label = ui.label("").classes("whitespace-pre-wrap w-full")
-
     footer = ui.footer().classes("w-full bg-gray-100 border-t")
     with footer:
-        status_label = ui.label(f"Status: {state.status}").classes(
-            "w-full max-w-5xl mx-auto p-3"
+        status_label = ui.label(state.status).classes(
+            "w-full max-w-3xl mx-auto p-3 text-black"
         )
 
     def refresh_view() -> None:
-        current_question_label.set_text(state.current_question)
-        recognized_answer_label.set_text(state.recognized_answer)
-        status_label.set_text(f"Status: {state.status}")
-        summary_label.set_text(state.summary)
-        report_label.set_text(state.report)
+        status_label.set_text(state.status)
 
         if state.tts_audio_url:
             audio_player.set_source(state.tts_audio_url)
-            audio_player.run_method("load")
-            audio_player.run_method("play")
-        else:
-            audio_player.set_source("")
+            audio_player.play()
 
         chat_container.clear()
         with chat_container:
             for message in state.messages:
-                prefix = {
-                    "assistant": "Florian",
-                    "user": "Erkannt",
-                    "system": "System",
-                }[message.role]
+                if message.role == "assistant":
+                    align = "items-start"
+                    color = "bg-blue-50"
+                elif message.role == "user":
+                    align = "items-end"
+                    color = "bg-green-50"
+                else:
+                    align = "items-center"
+                    color = "bg-gray-50"
 
-                color_class = {
-                    "assistant": "bg-blue-50",
-                    "user": "bg-green-50",
-                    "system": "bg-gray-50",
-                }[message.role]
-
-                with ui.card().classes(f"w-full {color_class}"):
-                    ui.label(prefix).classes("text-sm text-gray-600")
-                    ui.label(message.text).classes("whitespace-pre-wrap")
+                with ui.row().classes(f"w-full {align}"):
+                    with ui.card().classes(f"{color} max-w-xl"):
+                        ui.label(message.text).classes("whitespace-pre-wrap")
 
     def on_start() -> None:
-        start_ui_session(state)
-        refresh_view()
-
-    def on_submit() -> None:
-        handle_text_input(state, text_input.value or "")
-        text_input.set_value("")
-        refresh_view()
-
-    def on_audio_upload(e: events.UploadEventArguments) -> None:
         try:
-            state.status = "Speichere Audio"
+            start_ui_session(state)
+        except Exception as exc:
+            state.status = f"Fehler beim Start: {exc}"
+            append_message(state, "system", f"Fehler beim Start: {exc}")
+        refresh_view()
+
+    async def on_record() -> None:
+        try:
+            if state.session is None:
+                start_ui_session(state)
+                refresh_view()
+
+            state.status = "Höre zu ..."
             refresh_view()
 
-            uploaded_name = e.name or "audio_upload"
-            suffix = Path(uploaded_name).suffix.lower() or ".wav"
-            target_path = create_uploaded_audio_path(suffix=suffix)
+            result = await ui.run_javascript(
+                build_browser_recorder_js(),
+                timeout=15.0,
+            )
 
-            target_path.write_bytes(e.content.read())
+            if not result:
+                raise RuntimeError("Browser-Aufnahme hat kein Ergebnis geliefert.")
 
-            state.status = "Transkribiere Audio"
+            mime_type = str(result.get("mimeType", "audio/webm"))
+            data_url = str(result.get("dataUrl", ""))
+            payload_size = int(result.get("size", 0))
+
+            print(f"Audio-Payload-Größe: {payload_size} Bytes")
+
+            if not data_url:
+                raise RuntimeError("Browser-Aufnahme enthält keine Audiodaten.")
+
+            suffix = suffix_from_mime_type(mime_type)
+            target_path = create_recorded_audio_path(suffix=suffix)
+            save_data_url_audio(data_url, target_path)
+
+            state.status = "Transkribiere Audio ..."
             refresh_view()
 
             transcript = transcribe_audio_file(target_path)
+            print("=== TRANSCRIPT ===")
+            print(transcript)
+            print("==================")
+
             handle_text_input(state, transcript)
 
-            state.status = "Audio verarbeitet"
+            state.status = "Warte auf Antwort"
         except Exception as exc:
-            state.status = f"Fehler bei Audioverarbeitung: {exc}"
-            append_message(state, "system", f"Fehler bei Audioverarbeitung: {exc}")
+            state.status = f"Fehler bei Audioaufnahme: {exc}"
+            append_message(state, "system", f"Fehler bei Audioaufnahme: {exc}")
+        refresh_view()
+
+    def on_text_toggle() -> None:
+        manual_text_input.set_visibility(not manual_text_input.visible)
+
+    def on_manual_submit() -> None:
+        try:
+            handle_text_input(state, manual_text_input.value or "")
+            manual_text_input.set_value("")
+        except Exception as exc:
+            state.status = f"Fehler bei Texteingabe: {exc}"
+            append_message(state, "system", f"Fehler bei Texteingabe: {exc}")
         refresh_view()
 
     start_button.on_click(on_start)
-    text_input.on("keydown.enter", lambda _: on_submit())
-    audio_upload.on_upload(on_audio_upload)
+    record_button.on_click(on_record)
+    text_toggle_button.on_click(on_text_toggle)
+    manual_text_input.on("keydown.enter", lambda _: on_manual_submit())
 
     refresh_view()
 

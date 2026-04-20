@@ -12,3 +12,4 @@ ruff
 pdoc
 mkdocs
 mkdocs-material
+google-genai
